@@ -1,0 +1,26 @@
+{
+  "training_phase": "Phase 1: Bilingual Foundation",
+  "epochs": 15,
+  "batch_size": 64,
+  "learning_rate": 0.0003,
+  "best_val_loss": 5.530133242302752,
+  "best_bleu_scores": {},
+  "training_data": {
+    "en_am_pairs": 209837,
+    "am_or_pairs": 143987,
+    "total_training_samples": 707648
+  },
+  "validation_data": {
+    "trilingual_triples": 1999
+  },
+  "model_config": {
+    "d_model": 128,
+    "n_heads": 4,
+    "n_layers": 2,
+    "d_ff": 256,
+    "dropout": 0.1,
+    "vocab_size": 15005,
+    "total_parameters": 6439453
+  },
+  "timestamp": "2026-06-08T08:17:46.612773"
+}

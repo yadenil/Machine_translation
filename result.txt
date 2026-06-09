@@ -1,0 +1,23 @@
+✓ Loading unified multilingual tokenizer...
+
+======================================================================
+VOCABULARY STATISTICS (UNIFIED MULTILINGUAL)
+======================================================================
+Tokenizer: spm_unified_multilingual
+Base vocabulary: 15,000 tokens
+Plus language tags: 3
+Plus special tokens: 4 (<pad>, <unk>, <bos>, <eos>)
+Total unified vocabulary: 15,005 tokens
+======================================================================
+
+Unified vocabulary size: 15005
+Device: cuda
+Loaded 1999 sentence triples
+Training samples: 10800 | Validation samples: 1194
+Model parameters: 6,439,453
+Epoch   1/60  train_loss=6.8025  train_acc=0.1824  val_loss=6.1798  val_acc=0.2367
+Epoch   5/60  train_loss=5.0706  train_acc=0.2809  val_loss=5.5939  val_acc=0.2913
+Epoch  10/60  train_loss=4.2875  train_acc=0.3416  val_loss=5.4656  val_acc=0.3185
+Epoch  15/60  train_loss=3.7497  train_acc=0.4125  val_loss=5.4692  val_acc=0.3295
+Epoch  20/60  train_loss=3.3846  train_acc=0.4770  val_loss=5.5461  val_acc=0.3364
+Epoch  25/60  train_loss=3.1443  train_acc=0.5255  val_loss=5.6136  val_acc=0.3429
