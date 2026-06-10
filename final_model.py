@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Phase 5 - Milestone 3.1: Convergence (WITH LANGUAGE TAGS)
+FIXED: Added causal mask, padding masks, and proper label shifting
 """
 
 import os
@@ -47,7 +48,7 @@ os.makedirs(CONFIG['output_dir'], exist_ok=True)
 import sentencepiece as spm
 
 print("="*80)
-print("PHASE 5 - MILESTONE 3.1: CONVERGENCE (WITH LANGUAGE TAGS)")
+print("PHASE 5 - MILESTONE 3.1: CONVERGENCE (WITH LANGUAGE TAGS) [FIXED]")
 print("="*80)
 
 # ============ TOKENIZER & VOCAB ============
@@ -88,11 +89,11 @@ def encode_sentence(text, lang, max_len=CONFIG['max_seq_length']):
     ids = ids[:max_len - 2]  # Truncate to leave room for BOS and EOS
     ids = [BOS_ID] + ids + [EOS_ID]  # Add BOS and EOS
     
-    
     while len(ids) < max_len:
         ids.append(PAD_ID)
     
     return ids[:max_len]  # Ensure exactly max_len
+
 # ============ DATA LOADING ============
 print("\n[2/8] Loading datasets...")
 
@@ -162,7 +163,15 @@ class ConvergenceDataset(Dataset):
         src_ids = encode_sentence(src_text, src_lang)
         tgt_ids = encode_sentence(tgt_text, tgt_lang)
         tgt_tag_id = TOKEN2ID[LANG_TAGS[tgt_lang]]
-        tgt_ids = [BOS_ID, tgt_tag_id] + tgt_ids[1:]
+        # FIX 1: Prepend language tag AFTER BOS, don't replace existing BOS
+        # Original was: tgt_ids = [BOS_ID, tgt_tag_id] + tgt_ids[1:]
+        # This replaced the first token (BOS) with tag — WRONG
+        # Fixed: insert tag right after BOS, keep rest of sequence
+        tgt_ids = [BOS_ID, tgt_tag_id] + tgt_ids[1:-1] + [EOS_ID]
+        # Ensure padding is correct after modification
+        while len(tgt_ids) < CONFIG['max_seq_length']:
+            tgt_ids.append(PAD_ID)
+        tgt_ids = tgt_ids[:CONFIG['max_seq_length']]
         
         return {
             'src': torch.tensor(src_ids, dtype=torch.long),
@@ -178,23 +187,38 @@ dataloader = DataLoader(dataset, batch_size=CONFIG['batch_size'], shuffle=True,
 print(f"✓ Dataset: {len(dataset)} samples/epoch")
 
 # ============ MODEL ============
+# FIX 2: Added causal mask and padding mask support to forward()
 class SimpleTransformer(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_heads=4, n_layers=2):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
-        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads,
-                                                dim_feedforward=512, batch_first=True)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=512, batch_first=True
+        )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-        dec_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=n_heads,
-                                                dim_feedforward=512, batch_first=True)
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=512, batch_first=True
+        )
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_layers)
         self.output_projection = nn.Linear(d_model, vocab_size)
         
-    def forward(self, src, tgt):
+    # FIX 2a: forward() now accepts masks
+    def forward(self, src, tgt, tgt_mask=None,
+                src_key_padding_mask=None,
+                tgt_key_padding_mask=None):
         src_emb = self.embedding(src)
         tgt_emb = self.embedding(tgt)
-        enc_out = self.encoder(src_emb)
-        dec_out = self.decoder(tgt_emb, enc_out)
+        # FIX 2b: Pass padding mask to encoder
+        enc_out = self.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
+        # FIX 2c: Pass causal mask AND padding mask to decoder
+        dec_out = self.decoder(
+            tgt_emb, enc_out,
+            tgt_mask=tgt_mask,                    # causal mask (upper triangular)
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=src_key_padding_mask
+        )
         return self.output_projection(dec_out)
     
     def get_encoder_params(self):
@@ -238,6 +262,11 @@ best_loss = float('inf')
 
 start_time = time.time()
 
+# FIX 3: Helper function to generate causal mask
+def generate_square_subsequent_mask(sz, device):
+    mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)
+    return mask.bool()  # True = masked position
+
 for epoch_idx in range(CONFIG['epochs']):
     abs_epoch = CONFIG['start_epoch'] + epoch_idx
     
@@ -257,10 +286,29 @@ for epoch_idx in range(CONFIG['epochs']):
         
         optimizer.zero_grad()
         
+        # FIX 4: Label shifting is already correct here
+        # tgt_input = everything except last token (what decoder sees)
+        # tgt_output = everything except first token (what we predict)
         tgt_input = tgt[:, :-1]
         tgt_output = tgt[:, 1:]
         
-        logits = model(src, tgt_input)
+        # FIX 5: Create masks
+        # 5a: Causal mask for decoder (prevents looking at future tokens)
+        tgt_len = tgt_input.size(1)
+        tgt_mask = generate_square_subsequent_mask(tgt_len, device)
+        
+        # 5b: Padding masks (tell model to ignore pad tokens)
+        src_key_padding_mask = (src == PAD_ID)  # True where pad
+        tgt_key_padding_mask = (tgt_input == PAD_ID)
+        
+        # FIX 6: Pass all masks to model
+        logits = model(
+            src, tgt_input,
+            tgt_mask=tgt_mask,
+            src_key_padding_mask=src_key_padding_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask
+        )
+        
         logits = logits.reshape(-1, logits.size(-1))
         tgt_output = tgt_output.reshape(-1)
         
