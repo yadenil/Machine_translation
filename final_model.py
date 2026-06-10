@@ -85,9 +85,14 @@ print(f"✓ Vocabulary: {VOCAB_SIZE} tokens")
 def encode_sentence(text, lang, max_len=CONFIG['max_seq_length']):
     pieces = tokenizer.encode(str(text), out_type=str)
     ids = [TOKEN2ID.get(p, UNK_ID) for p in pieces]
-    ids = ids[:max_len - 2]
-    return [BOS_ID] + ids + [EOS_ID]
-
+    ids = ids[:max_len - 2]  # Truncate to leave room for BOS and EOS
+    ids = [BOS_ID] + ids + [EOS_ID]  # Add BOS and EOS
+    
+    
+    while len(ids) < max_len:
+        ids.append(PAD_ID)
+    
+    return ids[:max_len]  # Ensure exactly max_len
 # ============ DATA LOADING ============
 print("\n[2/8] Loading datasets...")
 
