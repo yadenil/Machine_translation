@@ -90,7 +90,9 @@ def encode_sentence(text, lang, max_len=CONFIG['max_seq_length']):
     pieces = tokenizer.encode(str(text), out_type=str)
     ids = [TOKEN2ID.get(p, UNK_ID) for p in pieces]
     ids = ids[:max_len - 2]
-    return [BOS_ID] + ids + [EOS_ID]
+    ids = [BOS_ID] + ids + [EOS_ID]
+    ids = ids + [PAD_ID] * (max_len - len(ids))
+    return ids[:max_len]
 
 def decode_sentence(ids, lang):
     """Decode unified IDs back to text."""
