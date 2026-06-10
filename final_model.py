@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 """
-Phase 5 - Milestone 3.1: Validation & Convergence
-Final Training Run (Epochs 41-60)
-
-Settings:
-- Trilingual: 50% sampling (x5 duplication), loss weight = 2.0
-- Bilingual: 25% EN-AM + 25% AM-OR, loss weight = 0.8
-- LR decay: 0.1x every 5 epochs
-- Early stopping: if val BLEU plateaus for 10 epochs
+Phase 5 - Milestone 3.1: Convergence (WITH LANGUAGE TAGS)
 """
 
 import os
@@ -22,38 +15,26 @@ from torch.utils.data import Dataset, DataLoader
 from collections import Counter
 import matplotlib.pyplot as plt
 
-# ============ CONFIGURATION ============
 CONFIG = {
-    # Input paths
     'checkpoint_path': 'output/phase_5_milestone_2_2/trilingual_translator_v1_best.pt',
     'trilingual_path': 'output/data_final/clean_translation_final.csv',
     'en_am_path': 'output/data_final/amharic_english_final.csv',
     'am_or_path': 'output/data_final/amharic_oromo_final.csv',
-    
-    # Output
     'output_dir': 'output/phase_5_milestone_3_1',
-    
-    # Training
-    'start_epoch': 41,      # Absolute epoch number
-    'epochs': 20,           # Train for 20 epochs (41-60)
+    'start_epoch': 41,
+    'epochs': 20,
     'batch_size': 64,
     'base_lr': 3e-4,
     'lr_decay_factor': 0.1,
-    'lr_decay_every': 5,    # Decay every 5 epochs
-    
-    # Sampling & Weighting
-    'epoch_size': 80000,    # Total samples per epoch
-    'tri_pct': 0.50,        # 50% trilingual
-    'en_am_pct': 0.25,      # 25% EN-AM
-    'am_or_pct': 0.25,      # 25% AM-OR
-    'tri_duplication': 5,   # x5 duplication of trilingual data
-    'tri_weight': 2.0,      # Trilingual loss weight
-    'bi_weight': 0.8,       # Bilingual loss weight
-    
-    # Early stopping
-    'patience': 10,         # Stop if no improvement for 10 epochs
-    
-    # Model
+    'lr_decay_every': 5,
+    'epoch_size': 80000,
+    'tri_pct': 0.50,
+    'en_am_pct': 0.25,
+    'am_or_pct': 0.25,
+    'tri_duplication': 5,
+    'tri_weight': 2.0,
+    'bi_weight': 0.8,
+    'patience': 10,
     'd_model': 128,
     'n_heads': 4,
     'n_layers': 2,
@@ -66,88 +47,91 @@ os.makedirs(CONFIG['output_dir'], exist_ok=True)
 import sentencepiece as spm
 
 print("="*80)
-print("PHASE 5 - MILESTONE 3.1: VALIDATION & CONVERGENCE")
-print(f"Epochs {CONFIG['start_epoch']}-{CONFIG['start_epoch'] + CONFIG['epochs'] - 1}")
+print("PHASE 5 - MILESTONE 3.1: CONVERGENCE (WITH LANGUAGE TAGS)")
 print("="*80)
 
-# ============ TOKENIZER ============
-print("\n[1/8] Loading tokenizer...")
+# ============ TOKENIZER & VOCAB ============
+print("\n[1/8] Loading tokenizer and building vocabulary...")
+
 tokenizer = spm.SentencePieceProcessor()
 tokenizer.Load(CONFIG['tokenizer_path'])
-vocab_size = tokenizer.GetPieceSize()
-print(f"✓ Tokenizer loaded: {vocab_size} tokens")
+sp_vocab_size = tokenizer.GetPieceSize()
+
+PAD_ID = 0
+UNK_ID = 1
+BOS_ID = 2
+EOS_ID = 3
+LANG_TAGS = {"am": "<am>", "or": "<or>", "en": "<en>"}
+
+TOKEN2ID = {"<pad>": PAD_ID, "<unk>": UNK_ID, "<bos>": BOS_ID, "<eos>": EOS_ID}
+next_id = 4
+
+for tag in LANG_TAGS.values():
+    TOKEN2ID[tag] = next_id
+    next_id += 1
+
+for i in range(sp_vocab_size):
+    piece = tokenizer.id_to_piece(i)
+    if piece in TOKEN2ID:
+        continue
+    TOKEN2ID[piece] = next_id
+    next_id += 1
+
+ID2TOKEN = {v: k for k, v in TOKEN2ID.items()}
+VOCAB_SIZE = len(TOKEN2ID)
+
+print(f"✓ Vocabulary: {VOCAB_SIZE} tokens")
+
+def encode_sentence(text, lang, max_len=CONFIG['max_seq_length']):
+    pieces = tokenizer.encode(str(text), out_type=str)
+    ids = [TOKEN2ID.get(p, UNK_ID) for p in pieces]
+    ids = ids[:max_len - 2]
+    return [BOS_ID] + ids + [EOS_ID]
 
 # ============ DATA LOADING ============
 print("\n[2/8] Loading datasets...")
 
-# Load trilingual and create x5 duplication
 tri_df = pd.read_csv(CONFIG['trilingual_path'])
-print(f"✓ Trilingual original: {len(tri_df)} rows")
-
-# x5 duplication = 10K virtual samples
 tri_dup = pd.concat([tri_df] * CONFIG['tri_duplication'], ignore_index=True)
-tri_dup['dup_group'] = [i // len(tri_df) for i in range(len(tri_dup))]
-print(f"✓ Trilingual x{CONFIG['tri_duplication']}: {len(tri_dup)} rows")
 
-# Load bilingual
 en_am_df = pd.read_csv(CONFIG['en_am_path'])
 am_or_df = pd.read_csv(CONFIG['am_or_path'])
+
+print(f"✓ Trilingual x{CONFIG['tri_duplication']}: {len(tri_dup)} rows")
 print(f"✓ EN-AM: {len(en_am_df)} rows")
 print(f"✓ AM-OR: {len(am_or_df)} rows")
 
-# ============ AUTO-DETECT COLUMNS ============
-def detect_columns(df, expected):
-    cols = list(df.columns)
-    found = {}
-    for key, patterns in expected.items():
-        for c in cols:
-            if any(p.lower() in c.lower() for p in patterns):
-                found[key] = c
-                break
-    return found
-
-tri_cols = detect_columns(tri_df, {
-    'en': ['english', 'en'],
-    'am': ['amharic', 'am'],
-    'or': ['oromo', 'afa', 'or ']
-})
-enam_cols = detect_columns(en_am_df, {'am': ['amharic'], 'en': ['english']})
-amor_cols = detect_columns(am_or_df, {'am': ['amharic'], 'or': ['oromo', 'afa']})
-
-print(f"  Trilingual columns: {tri_cols}")
-print(f"  EN-AM columns: {enam_cols}")
-print(f"  AM-OR columns: {amor_cols}")
-
 # ============ DATASET ============
 class ConvergenceDataset(Dataset):
-    def __init__(self, tri_data, en_am_data, am_or_data, tokenizer):
+    def __init__(self, tri_data, en_am_data, am_or_data):
         self.tri_data = tri_data.reset_index(drop=True)
         self.en_am_data = en_am_data.reset_index(drop=True)
         self.am_or_data = am_or_data.reset_index(drop=True)
-        self.tokenizer = tokenizer
         
-        # Pre-tokenize everything
         print("  Pre-tokenizing...")
         
-        # Trilingual (all 3 directions)
-        self.tri_en = [self._tok(row[tri_cols['en']]) for _, row in self.tri_data.iterrows()]
-        self.tri_am = [self._tok(row[tri_cols['am']]) for _, row in self.tri_data.iterrows()]
-        self.tri_or = [self._tok(row[tri_cols['or']]) for _, row in self.tri_data.iterrows()]
+        self.tri_samples = []
+        for _, row in self.tri_data.iterrows():
+            en, am, or_ = row['English'], row['Amharic'], row['Oromo']
+            self.tri_samples.append(('en', 'am', en, am))
+            self.tri_samples.append(('am', 'en', am, en))
+            self.tri_samples.append(('am', 'or', am, or_))
+            self.tri_samples.append(('or', 'am', or_, am))
+            self.tri_samples.append(('en', 'or', en, or_))
+            self.tri_samples.append(('or', 'en', or_, en))
         
-        # Bilingual
-        self.enam_src = [self._tok(row[enam_cols['en']]) for _, row in self.en_am_data.iterrows()]
-        self.enam_tgt = [self._tok(row[enam_cols['am']]) for _, row in self.en_am_data.iterrows()]
+        self.enam_samples = []
+        for _, row in self.en_am_data.iterrows():
+            self.enam_samples.append(('en', 'am', row['English'], row['Amharic']))
+            self.enam_samples.append(('am', 'en', row['Amharic'], row['English']))
         
-        self.amor_src = [self._tok(row[amor_cols['am']]) for _, row in self.am_or_data.iterrows()]
-        self.amor_tgt = [self._tok(row[amor_cols['or']]) for _, row in self.am_or_data.iterrows()]
+        self.amor_samples = []
+        for _, row in self.am_or_data.iterrows():
+            c = list(row)
+            self.amor_samples.append(('am', 'or', c[0], c[1]))
+            self.amor_samples.append(('or', 'am', c[1], c[0]))
         
         print("  ✓ Pre-tokenization complete")
-    
-    def _tok(self, text):
-        tokens = self.tokenizer.encode(str(text))
-        tokens = tokens[:CONFIG['max_seq_length']]
-        tokens = tokens + [0] * (CONFIG['max_seq_length'] - len(tokens))
-        return torch.tensor(tokens, dtype=torch.long)
     
     def __len__(self):
         return CONFIG['epoch_size']
@@ -155,60 +139,38 @@ class ConvergenceDataset(Dataset):
     def __getitem__(self, idx):
         r = np.random.random()
         
-        # 50% Trilingual (x5 duplication provides 10K unique, cycled 4x per epoch)
         if r < CONFIG['tri_pct']:
-            i = np.random.randint(0, len(self.tri_data))
-            # Randomly pick one of 3 directions from trilingual
-            dir_r = np.random.random()
-            if dir_r < 0.33:
-                src, tgt = self.tri_en[i], self.tri_am[i]  # EN→AM
-            elif dir_r < 0.66:
-                src, tgt = self.tri_am[i], self.tri_or[i]  # AM→OR
-            else:
-                src, tgt = self.tri_en[i], self.tri_or[i]  # EN→OR
+            s = self.tri_samples[np.random.randint(0, len(self.tri_samples))]
             pair_type = 'trilingual'
             weight = CONFIG['tri_weight']
-            
-        # 25% EN-AM
         elif r < (CONFIG['tri_pct'] + CONFIG['en_am_pct']):
-            i = np.random.randint(0, len(self.en_am_data))
-            src, tgt = self.enam_src[i], self.enam_tgt[i]
+            s = self.enam_samples[np.random.randint(0, len(self.enam_samples))]
             pair_type = 'en_am'
             weight = CONFIG['bi_weight']
-            
-        # 25% AM-OR
         else:
-            i = np.random.randint(0, len(self.am_or_data))
-            src, tgt = self.amor_src[i], self.amor_tgt[i]
+            s = self.amor_samples[np.random.randint(0, len(self.amor_samples))]
             pair_type = 'am_or'
             weight = CONFIG['bi_weight']
         
+        src_lang, tgt_lang, src_text, tgt_text = s
+        
+        src_ids = encode_sentence(src_text, src_lang)
+        tgt_ids = encode_sentence(tgt_text, tgt_lang)
+        tgt_tag_id = TOKEN2ID[LANG_TAGS[tgt_lang]]
+        tgt_ids = [BOS_ID, tgt_tag_id] + tgt_ids[1:]
+        
         return {
-            'src': src,
-            'tgt': tgt,
+            'src': torch.tensor(src_ids, dtype=torch.long),
+            'tgt': torch.tensor(tgt_ids, dtype=torch.long),
             'pair_type': pair_type,
-            'loss_weight': weight
+            'loss_weight': weight,
         }
 
-dataset = ConvergenceDataset(tri_dup, en_am_df, am_or_df, tokenizer)
+dataset = ConvergenceDataset(tri_dup, en_am_df, am_or_df)
 dataloader = DataLoader(dataset, batch_size=CONFIG['batch_size'], shuffle=True,
                         num_workers=2, pin_memory=False)
 
 print(f"✓ Dataset: {len(dataset)} samples/epoch")
-print(f"  Sampling: {CONFIG['tri_pct']*100:.0f}% tri | {CONFIG['en_am_pct']*100:.0f}% EN-AM | {CONFIG['am_or_pct']*100:.0f}% AM-OR")
-
-# ============ VERIFY BATCH COMPOSITION ============
-print("\n[3/8] Verifying batch composition...")
-sample_types = []
-for i, batch in enumerate(dataloader):
-    if i >= 10:
-        break
-    sample_types.extend(batch['pair_type'] if isinstance(batch['pair_type'], list) else batch['pair_type'].tolist())
-
-counts = Counter(sample_types)
-total = sum(counts.values())
-for pt, c in counts.items():
-    print(f"  {pt}: {c}/{total} ({c/total*100:.1f}%)")
 
 # ============ MODEL ============
 class SimpleTransformer(nn.Module):
@@ -239,7 +201,7 @@ class SimpleTransformer(nn.Module):
 # ============ LOAD CHECKPOINT ============
 print("\n[4/8] Loading checkpoint from Phase 5.2...")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = SimpleTransformer(vocab_size, CONFIG['d_model'], CONFIG['n_heads'], CONFIG['n_layers'])
+model = SimpleTransformer(VOCAB_SIZE, CONFIG['d_model'], CONFIG['n_heads'], CONFIG['n_layers'])
 
 start_epoch_abs = CONFIG['start_epoch']
 best_val_bleu = 0.0
@@ -247,59 +209,40 @@ patience_counter = 0
 
 if os.path.exists(CONFIG['checkpoint_path']):
     ckpt = torch.load(CONFIG['checkpoint_path'], map_location=device)
-    
-    if isinstance(ckpt, dict):
-        if 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
-            print("✓ Loaded from 'model_state_dict'")
-            if 'epoch' in ckpt:
-                start_epoch_abs = ckpt['epoch'] + 1
-                print(f"  Resuming from epoch {start_epoch_abs}")
-        elif 'model_state' in ckpt:
-            try:
-                model.load_state_dict(ckpt['model_state'])
-                print("✓ Loaded from 'model_state'")
-            except:
-                print("⚠ Custom checkpoint mismatch. Training from scratch.")
-        else:
-            try:
-                model.load_state_dict(ckpt)
-                print("✓ Loaded checkpoint directly")
-            except:
-                print("⚠ Checkpoint mismatch. Training from scratch.")
+    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        model.load_state_dict(ckpt['model_state_dict'])
+        print("✓ Loaded from Phase 5.2")
+        if 'epoch' in ckpt:
+            start_epoch_abs = ckpt['epoch'] + 1
     else:
-        print("⚠ Unknown checkpoint format. Training from scratch.")
+        print("⚠ Could not load checkpoint")
 else:
-    print("⚠ No checkpoint found. Training from scratch.")
+    print("⚠ No checkpoint found")
 
 model = model.to(device)
 
-# ============ TRAINING WITH LR DECAY & EARLY STOPPING ============
+# ============ TRAINING ============
 print("\n[5/8] Starting convergence training...")
 
-criterion = nn.CrossEntropyLoss(ignore_index=0)
+criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
 losses = []
 val_bleus = []
 lr_history = []
 best_epoch = 0
+best_loss = float('inf')
 
 start_time = time.time()
 
 for epoch_idx in range(CONFIG['epochs']):
     abs_epoch = CONFIG['start_epoch'] + epoch_idx
     
-    # LR decay: 0.1x every 5 epochs
     decay_steps = epoch_idx // CONFIG['lr_decay_every']
     current_lr = CONFIG['base_lr'] * (CONFIG['lr_decay_factor'] ** decay_steps)
-    
-    # Create optimizer with current LR
     optimizer = optim.Adam(model.parameters(), lr=current_lr)
     
-    # Training
     model.train()
     epoch_loss = 0
     batch_count = 0
-    
     epoch_start = time.time()
     
     for batch_idx, batch in enumerate(dataloader):
@@ -333,18 +276,15 @@ for epoch_idx in range(CONFIG['epochs']):
     losses.append(avg_loss)
     lr_history.append(current_lr)
     
-    # Validation (placeholder — add your BLEU eval here)
-    # For now, we use loss as proxy for early stopping
-    # Replace this with actual BLEU evaluation on validation set
-    val_bleu = 0.0  # TODO: compute BLEU on held-out set
+    # Placeholder for BLEU (replace with real eval when ready)
+    val_bleu = 0.0
     val_bleus.append(val_bleu)
     
-    # Early stopping check
-    if val_bleu > best_val_bleu:
-        best_val_bleu = val_bleu
+    # Save best by loss (since BLEU is placeholder)
+    if avg_loss < best_loss:
+        best_loss = avg_loss
         best_epoch = abs_epoch
         patience_counter = 0
-        # Save best
         torch.save({
             'epoch': abs_epoch,
             'model_state_dict': model.state_dict(),
@@ -352,36 +292,36 @@ for epoch_idx in range(CONFIG['epochs']):
             'loss': avg_loss,
             'val_bleu': val_bleu,
             'config': CONFIG,
+            'token2id': TOKEN2ID,
+            'id2token': ID2TOKEN,
+            'vocab_size': VOCAB_SIZE,
         }, f"{CONFIG['output_dir']}/final_translator_best.pt")
+        print(f"    ✓ NEW BEST saved (loss: {avg_loss:.4f})")
     else:
         patience_counter += 1
     
-    # Timing
     epoch_time = time.time() - epoch_start
     elapsed = time.time() - start_time
-    remaining = (CONFIG['epochs'] - epoch_idx - 1) * epoch_time if epoch_idx > 0 else 0
     
     def fmt(t):
         return f"{int(t//3600)}h {int((t%3600)//60)}m"
     
-    freeze_tag = ""
     print(f"  Epoch {abs_epoch:2d}: Loss={avg_loss:.4f} | LR={current_lr:.0e} | "
-          f"Time={fmt(epoch_time)} | Elapsed={fmt(elapsed)} | ETA={fmt(remaining)}{freeze_tag}")
+          f"Time={fmt(epoch_time)} | Elapsed={fmt(elapsed)}{' [FROZEN]' if False else ''}")
     
-    # Early stopping trigger
     if patience_counter >= CONFIG['patience']:
-        print(f"\n  🛑 Early stopping triggered! No improvement for {CONFIG['patience']} epochs.")
-        print(f"     Best was epoch {best_epoch} with val BLEU {best_val_bleu:.2f}")
+        print(f"\n  🛑 Early stopping!")
         break
 
-# ============ SAVE FINAL MODEL ============
-print("\n[6/8] Saving final model...")
-
+# Final save
 torch.save({
     'model_state_dict': model.state_dict(),
     'config': CONFIG,
     'final_epoch': best_epoch,
     'final_loss': losses[-1],
+    'token2id': TOKEN2ID,
+    'id2token': ID2TOKEN,
+    'vocab_size': VOCAB_SIZE,
     'training_history': {
         'losses': [float(l) for l in losses],
         'val_bleus': val_bleus,
@@ -389,105 +329,10 @@ torch.save({
     }
 }, f"{CONFIG['output_dir']}/final_translator_multilingual.pt")
 
-print(f"✓ Saved: {CONFIG['output_dir']}/final_translator_multilingual.pt")
-
-# ============ PLOTS ============
-print("\n[7/8] Generating convergence plots...")
-
-fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-# Loss curve
-axes[0, 0].plot(range(CONFIG['start_epoch'], CONFIG['start_epoch'] + len(losses)), losses, 'b-o')
-axes[0, 0].set_title('Training Loss')
-axes[0, 0].set_xlabel('Epoch')
-axes[0, 0].set_ylabel('Loss')
-axes[0, 0].grid(True, alpha=0.3)
-
-# LR decay
-axes[0, 1].plot(range(CONFIG['start_epoch'], CONFIG['start_epoch'] + len(lr_history)), lr_history, 'r-s')
-axes[0, 1].set_title('Learning Rate Decay')
-axes[0, 1].set_xlabel('Epoch')
-axes[0, 1].set_ylabel('LR')
-axes[0, 1].set_yscale('log')
-axes[0, 1].grid(True, alpha=0.3)
-
-# Val BLEU
-axes[1, 0].plot(range(CONFIG['start_epoch'], CONFIG['start_epoch'] + len(val_bleus)), val_bleus, 'g-^')
-axes[1, 0].set_title('Validation BLEU (Placeholder)')
-axes[1, 0].set_xlabel('Epoch')
-axes[1, 0].set_ylabel('BLEU')
-axes[1, 0].grid(True, alpha=0.3)
-
-# Sampling ratio text
-axes[1, 1].axis('off')
-summary_text = f"""
-Convergence Configuration
-━━━━━━━━━━━━━━━━━━━━━━━━━
-Epochs: {CONFIG['start_epoch']}-{best_epoch}
-Trilingual: {CONFIG['tri_pct']*100:.0f}% (x{CONFIG['tri_duplication']} dup)
-Bilingual: {(CONFIG['en_am_pct']+CONFIG['am_or_pct'])*100:.0f}% split
-Tri weight: {CONFIG['tri_weight']}
-Bi weight: {CONFIG['bi_weight']}
-LR: {CONFIG['base_lr']} → {lr_history[-1]:.0e}
-Early stop: {patience_counter >= CONFIG['patience']}
-"""
-axes[1, 1].text(0.1, 0.5, summary_text, fontsize=12, family='monospace',
-                verticalalignment='center')
-
-plt.tight_layout()
-plt.savefig(f"{CONFIG['output_dir']}/convergence_metrics.png", dpi=300)
-print(f"✓ Plot saved: {CONFIG['output_dir']}/convergence_metrics.png")
-
-# ============ REPORT ============
-print("\n[8/8] Generating report...")
-
-report = {
-    "milestone": "3.1 - Validation & Convergence",
-    "phase": "Phase 5: Implementation Roadmap",
-    "config": CONFIG,
-    "training_summary": {
-        "epochs_trained": len(losses),
-        "start_epoch": CONFIG['start_epoch'],
-        "end_epoch": best_epoch,
-        "final_loss": float(losses[-1]),
-        "best_val_bleu": float(best_val_bleu),
-        "best_epoch": best_epoch,
-        "early_stopped": patience_counter >= CONFIG['patience'],
-    },
-    "lr_schedule": {
-        "base_lr": CONFIG['base_lr'],
-        "final_lr": lr_history[-1],
-        "history": lr_history,
-    },
-    "sampling": {
-        "trilingual_pct": CONFIG['tri_pct'] * 100,
-        "en_am_pct": CONFIG['en_am_pct'] * 100,
-        "am_or_pct": CONFIG['am_or_pct'] * 100,
-        "trilingual_duplication": CONFIG['tri_duplication'],
-    },
-    "loss_weighting": {
-        "trilingual": CONFIG['tri_weight'],
-        "bilingual": CONFIG['bi_weight'],
-    },
-    "files": {
-        "final_model": f"{CONFIG['output_dir']}/final_translator_multilingual.pt",
-        "best_model": f"{CONFIG['output_dir']}/final_translator_best.pt",
-        "plot": f"{CONFIG['output_dir']}/convergence_metrics.png",
-    }
-}
-
-with open(f"{CONFIG['output_dir']}/convergence_metrics.json", 'w') as f:
-    json.dump(report, f, indent=2)
-
-print(f"✓ Report saved: {CONFIG['output_dir']}/convergence_metrics.json")
-
 print("\n" + "="*80)
 print("MILESTONE 3.1 COMPLETE")
 print("="*80)
 print(f"✓ Final model: {CONFIG['output_dir']}/final_translator_multilingual.pt")
 print(f"✓ Best model:  {CONFIG['output_dir']}/final_translator_best.pt")
-print(f"✓ Report:      {CONFIG['output_dir']}/convergence_metrics.json")
-print(f"✓ Plot:        {CONFIG['output_dir']}/convergence_metrics.png")
-print(f"\n⚠ NOTE: Validation BLEU is currently a placeholder.")
-print(f"  Add your BLEU evaluation function to enable real early stopping.")
+print(f"✓ Vocab size: {VOCAB_SIZE} (with language tags)")
 print("="*80)
