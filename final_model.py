@@ -94,18 +94,68 @@ def encode_sentence(text, lang, max_len=CONFIG['max_seq_length']):
     
     return ids[:max_len]  # Ensure exactly max_len
 
-# ============ DATA LOADING ============
-print("\n[2/8] Loading datasets...")
+# ============ DATA LOADING & TRAIN/VAL/TEST SPLIT ============
+print("\n[2/8] Loading datasets and creating 80/10/10 train/val/test split...")
 
-tri_df = pd.read_csv(CONFIG['trilingual_path'])
-tri_dup = pd.concat([tri_df] * CONFIG['tri_duplication'], ignore_index=True)
+# Load raw data
+tri_raw = pd.read_csv(CONFIG['trilingual_path'])
+en_am_raw = pd.read_csv(CONFIG['en_am_path'])
+am_or_raw = pd.read_csv(CONFIG['am_or_path'])
 
-en_am_df = pd.read_csv(CONFIG['en_am_path'])
-am_or_df = pd.read_csv(CONFIG['am_or_path'])
+print(f"\n  Original dataset sizes:")
+print(f"    Trilingual: {len(tri_raw)} rows")
+print(f"    EN-AM:      {len(en_am_raw)} rows")
+print(f"    AM-OR:      {len(am_or_raw)} rows")
 
+# Create 80/10/10 splits (random_state=42 for reproducibility)
+print(f"\n  Creating 80/10/10 train/val/test splits...")
+
+tri_val_test = tri_raw.sample(frac=0.2, random_state=42)
+tri_train = tri_raw.drop(tri_val_test.index)
+tri_val = tri_val_test.sample(frac=0.5, random_state=42)
+tri_test = tri_val_test.drop(tri_val.index)
+
+en_am_val_test = en_am_raw.sample(frac=0.2, random_state=42)
+en_am_train = en_am_raw.drop(en_am_val_test.index)
+en_am_val = en_am_val_test.sample(frac=0.5, random_state=42)
+en_am_test = en_am_val_test.drop(en_am_val.index)
+
+am_or_val_test = am_or_raw.sample(frac=0.2, random_state=42)
+am_or_train = am_or_raw.drop(am_or_val_test.index)
+am_or_val = am_or_val_test.sample(frac=0.5, random_state=42)
+am_or_test = am_or_val_test.drop(am_or_val.index)
+
+# Save all splits to disk
+split_dir = CONFIG['output_dir']
+print(f"\n  Saving all splits to {split_dir}/...")
+
+tri_train.to_csv(f'{split_dir}/train_trilingual.csv', index=False)
+tri_val.to_csv(f'{split_dir}/val_trilingual.csv', index=False)
+tri_test.to_csv(f'{split_dir}/test_trilingual.csv', index=False)
+
+en_am_train.to_csv(f'{split_dir}/train_en_am.csv', index=False)
+en_am_val.to_csv(f'{split_dir}/val_en_am.csv', index=False)
+en_am_test.to_csv(f'{split_dir}/test_en_am.csv', index=False)
+
+am_or_train.to_csv(f'{split_dir}/train_am_or.csv', index=False)
+am_or_val.to_csv(f'{split_dir}/val_am_or.csv', index=False)
+am_or_test.to_csv(f'{split_dir}/test_am_or.csv', index=False)
+
+print(f"  ✓ All 9 split files saved")
+
+# Print split breakdown
+print(f"\n  Split breakdown:")
+print(f"    Trilingual: train={len(tri_train)}, val={len(tri_val)}, test={len(tri_test)}")
+print(f"    EN-AM:      train={len(en_am_train)}, val={len(en_am_val)}, test={len(en_am_test)}")
+print(f"    AM-OR:      train={len(am_or_train)}, val={len(am_or_val)}, test={len(am_or_test)}")
+
+# Use ONLY train splits for training (duplicate trilingual)
+tri_dup = pd.concat([tri_train] * CONFIG['tri_duplication'], ignore_index=True)
+
+print(f"\n  Training set sizes (after duplication):")
 print(f"✓ Trilingual x{CONFIG['tri_duplication']}: {len(tri_dup)} rows")
-print(f"✓ EN-AM: {len(en_am_df)} rows")
-print(f"✓ AM-OR: {len(am_or_df)} rows")
+print(f"✓ EN-AM: {len(en_am_train)} rows")
+print(f"✓ AM-OR: {len(am_or_train)} rows")
 
 # ============ DATASET ============
 class ConvergenceDataset(Dataset):
@@ -180,7 +230,7 @@ class ConvergenceDataset(Dataset):
             'loss_weight': weight,
         }
 
-dataset = ConvergenceDataset(tri_dup, en_am_df, am_or_df)
+dataset = ConvergenceDataset(tri_dup, en_am_train, am_or_train)
 dataloader = DataLoader(dataset, batch_size=CONFIG['batch_size'], shuffle=True,
                         num_workers=2, pin_memory=False)
 

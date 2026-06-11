@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
 """
-BLEU Evaluation Script for Phase 5 Final Model
+BLEU Evaluation Script — Phase 5 Final Model
+Evaluates on HELD-OUT test set (80/10/10 split)
 
-Evaluates all 6 translation directions using sacrebleu.
-Requires: pip install sacrebleu
+This provides HONEST BLEU scores on unseen data that was held out before training.
 
 Usage:
     python evaluate_bleu.py \
         --model output/phase_5_milestone_3_1/final_translator_best.pt \
-        --test-data output/data_final/clean_translation_final.csv \
         --output bleu_results.json
 """
 
 import argparse
 import json
+import os
 import torch
 import sentencepiece as spm
 import sacrebleu
 from typing import List, Dict
+import pandas as pd
 
-
-# ============ MODEL (same as inference_final.py) ============
-
-import torch.nn as nn
+# ============ CONSTANTS ============
 
 PAD_ID = 0
 UNK_ID = 1
@@ -30,6 +28,10 @@ BOS_ID = 2
 EOS_ID = 3
 MAX_LEN = 80
 LANG_TAGS = {"am": "<am>", "or": "<or>", "en": "<en>"}
+
+# ============ MODEL ============
+
+import torch.nn as nn
 
 
 class SimpleTransformer(nn.Module):
@@ -48,11 +50,18 @@ class SimpleTransformer(nn.Module):
         self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_layers)
         self.output_projection = nn.Linear(d_model, vocab_size)
 
-    def forward(self, src, tgt):
+    def forward(self, src, tgt, tgt_mask=None,
+                src_key_padding_mask=None,
+                tgt_key_padding_mask=None):
         src_emb = self.embedding(src)
         tgt_emb = self.embedding(tgt)
-        enc_out = self.encoder(src_emb)
-        dec_out = self.decoder(tgt_emb, enc_out)
+        enc_out = self.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
+        dec_out = self.decoder(
+            tgt_emb, enc_out,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=src_key_padding_mask
+        )
         return self.output_projection(dec_out)
 
 
@@ -61,29 +70,30 @@ class SimpleTransformer(nn.Module):
 class Translator:
     def __init__(self, model_path: str, tokenizer_path: str):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Load tokenizer
-        self.sp = spm.SentencePieceProcessor()
-        self.sp.load(tokenizer_path)
-        self.vocab_size = self.sp.GetPieceSize()
-        
-        # Build vocab
-        self.token2id = {self.sp.IdToPiece(i): i for i in range(self.vocab_size)}
-        self.id2token = {i: self.sp.IdToPiece(i) for i in range(self.vocab_size)}
-        
-        # Load model
+
+        print(f"Loading checkpoint from {model_path}...")
         ckpt = torch.load(model_path, map_location=self.device, weights_only=False)
-        
-        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+
+        # Load vocab from checkpoint
+        if 'token2id' in ckpt and 'id2token' in ckpt:
+            self.token2id = ckpt['token2id']
+            self.id2token = ckpt['id2token']
+            self.vocab_size = ckpt.get('vocab_size', len(self.token2id))
+            print("  ✓ Loaded vocabulary from checkpoint")
+        else:
+            raise ValueError("Checkpoint missing token2id/id2token")
+
+        # Load model
+        if 'model_state_dict' in ckpt:
             state = ckpt['model_state_dict']
             config = ckpt.get('config', {})
-        elif isinstance(ckpt, dict) and 'model_state' in ckpt:
+        elif 'model_state' in ckpt:
             state = ckpt['model_state']
             config = ckpt.get('config', {})
         else:
             state = ckpt
             config = {}
-        
+
         self.model = SimpleTransformer(
             self.vocab_size,
             d_model=config.get('d_model', 128),
@@ -93,160 +103,177 @@ class Translator:
         self.model.load_state_dict(state)
         self.model.eval()
 
-    def encode(self, text: str) -> List[int]:
-        pieces = self.sp.encode(str(text), out_type=str)
-        ids = [self.token2id.get(p, UNK_ID) for p in pieces]
-        ids = ids[:MAX_LEN - 2]
-        return [BOS_ID] + ids + [EOS_ID]
+        # Load SentencePiece
+        self.sp = spm.SentencePieceProcessor()
+        self.sp.load(tokenizer_path)
 
-    def decode(self, ids: List[int]) -> str:
-        valid = []
-        for i in ids:
-            if i in (PAD_ID, BOS_ID, EOS_ID):
-                continue
-            piece = self.id2token.get(i, "<unk>")
-            if piece in ('<am>', '<or>', '<en>'):
-                continue
-            valid.append(i)
-        return self.sp.decode(valid)
+        print(f"  ✓ Model loaded! Vocab: {self.vocab_size}")
+
+    def _generate_square_subsequent_mask(self, sz):
+        mask = torch.triu(torch.ones(sz, sz, device=self.device), diagonal=1)
+        return mask.bool()
 
     def translate(self, text: str, src_lang: str, tgt_lang: str) -> str:
-        src_ids = self.encode(text)
+        if src_lang not in LANG_TAGS or tgt_lang not in LANG_TAGS:
+            raise ValueError(f"Invalid lang. Use: {list(LANG_TAGS.keys())}")
+
+        # Encode source
+        pieces = self.sp.encode(str(text), out_type=str)
+        src_ids = [self.token2id.get(p, UNK_ID) for p in pieces]
+        src_ids = [BOS_ID] + src_ids[:MAX_LEN-2] + [EOS_ID]
         src_tensor = torch.tensor([src_ids], dtype=torch.long, device=self.device)
-        
-        tgt_tag_id = self.token2id.get(LANG_TAGS[tgt_lang], UNK_ID)
+
+        # Decode with language tag
+        tgt_tag_id = self.token2id[LANG_TAGS[tgt_lang]]
         tgt_ids = [BOS_ID, tgt_tag_id]
-        
+
         with torch.no_grad():
             for _ in range(MAX_LEN):
                 tgt_tensor = torch.tensor([tgt_ids], dtype=torch.long, device=self.device)
-                logits = self.model(src_tensor, tgt_tensor)
+                tgt_mask = self._generate_square_subsequent_mask(tgt_tensor.size(1))
+                logits = self.model(src_tensor, tgt_tensor, tgt_mask=tgt_mask)
                 next_id = logits[0, -1].argmax().item()
                 if next_id == EOS_ID:
-            # 
-                  tgt_ids.append(next_id)
-        
-        return self.decode(tgt_ids)
+                    break
+                tgt_ids.append(next_id)
+
+        # Decode output
+        pieces = []
+        for i in tgt_ids:
+            if i in (PAD_ID, BOS_ID, EOS_ID):
+                continue
+            token = self.id2token.get(i, "<unk>")
+            if token in LANG_TAGS.values():
+                continue
+            pieces.append(token)
+
+        return self.sp.decode(pieces)
 
 
 # ============ EVALUATION ============
 
-def evaluate_direction(translator: Translator, sources: List[str], references: List[str], 
+def evaluate_direction(translator: Translator, sources: List[str], references: List[str],
                        src_lang: str, tgt_lang: str) -> Dict:
     """Evaluate one translation direction."""
     print(f"\n  Evaluating {src_lang} → {tgt_lang} ({len(sources)} sentences)...")
-    
+
     hypotheses = []
     for i, src in enumerate(sources):
         hyp = translator.translate(src, src_lang, tgt_lang)
         hypotheses.append(hyp)
         if (i + 1) % 100 == 0:
             print(f"    {i+1}/{len(sources)} done")
-    
+
     # Compute BLEU
     bleu = sacrebleu.corpus_bleu(hypotheses, [references])
-    
+
     # Compute chrF
     chrf = sacrebleu.corpus_chrf(hypotheses, [references])
-    
+
     # Show 3 examples
-    print(f"\n    Examples:")
+    print(f"\n    Examples (from test set):")
     for s, h, r in zip(sources[:3], hypotheses[:3], references[:3]):
-        print(f"      SRC: {s[:60]}")
-        print(f"      HYP: {h[:60]}")
-        print(f"      REF: {r[:60]}")
+        print(f"      SRC [{src_lang}]: {s[:80]}")
+        print(f"      HYP [{tgt_lang}]: {h[:80]}")
+        print(f"      REF [{tgt_lang}]: {r[:80]}")
         print()
-    
+
     return {
         "bleu": bleu.score,
-        "bleu_signature": bleu.signature,
         "chrf": chrf.score,
-        "chrf_signature": chrf.signature,
         "num_sentences": len(sources),
     }
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="BLEU Evaluation on Held-Out Test Set (80/10/10 split)"
+    )
     parser.add_argument("--model", required=True, help="Path to model checkpoint")
     parser.add_argument("--tokenizer", default="output/spm_unified_multilingual.model")
-    parser.add_argument("--test-data", required=True, help="Path to test CSV (trilingual)")
+    parser.add_argument("--model-dir", default="output/phase_5_milestone_3_1",
+                        help="Path to model output directory containing test splits")
     parser.add_argument("--output", default="bleu_results.json")
     args = parser.parse_args()
 
-    print("=" * 60)
-    print("BLEU EVALUATION — Phase 5 Final Model")
-    print("=" * 60)
+    print("=" * 70)
+    print("BLEU EVALUATION — Held-Out Test Set (10% of original data)")
+    print("=" * 70)
+    print("\n✓ This evaluates on data that was NEVER used during training.")
+    print("✓ Scores here reflect TRUE generalization ability on unseen data.\n")
 
     # Load model
-    print(f"\n[1/3] Loading model from {args.model}...")
+    print(f"[1/3] Loading model from {args.model}...")
     translator = Translator(args.model, args.tokenizer)
 
-    # Load test data
-    print(f"\n[2/3] Loading test data from {args.test_data}...")
-    import pandas as pd
-    df = pd.read_csv(args.test_data)
-    print(f"  Loaded {len(df)} sentences")
-    print(f"  Columns: {list(df.columns)}")
+    # Load test data from model output directory
+    print(f"\n[2/3] Loading held-out test data from {args.model_dir}...")
 
-    # Auto-detect columns
-    cols = list(df.columns)
-    col_map = {}
-    col_map = {'en': 'English', 'am': 'Amharic', 'or': 'Oromo'}
-    pass  # Hardcoded columns
-        # Auto-detection replaced with hardcoded
-        # See col_map above
-        # 
-    
-    print(f"  Detected: {col_map}")
+    tri_test = pd.read_csv(f'{args.model_dir}/test_trilingual.csv')
+    en_am_test = pd.read_csv(f'{args.model_dir}/test_en_am.csv')
+    am_or_test = pd.read_csv(f'{args.model_dir}/test_am_or.csv')
 
-    # Use last 20% as test set (hold-out)
-    test_size = int(len(df) * 0.2)
-    test_df = df.tail(test_size).reset_index(drop=True)
-    print(f"  Using {len(test_df)} sentences for evaluation (last 20%)")
+    print(f"  Trilingual test: {len(tri_test)} sentences")
+    print(f"  EN-AM test:      {len(en_am_test)} sentences")
+    print(f"  AM-OR test:      {len(am_or_test)} sentences")
 
     # Evaluate all 6 directions
-    print("\n[3/3] Evaluating all 6 translation directions...")
-    
+    print("\n[3/3] Evaluating all 6 translation directions on HELD-OUT test set...")
+
     results = {}
-    
-    directions = [
-        ("en", "am", col_map['en'], col_map['am']),
-        ("am", "en", col_map['am'], col_map['en']),
-        ("am", "or", col_map['am'], col_map['or']),
-        ("or", "am", col_map['or'], col_map['am']),
-        ("en", "or", col_map['en'], col_map['or']),
-        ("or", "en", col_map['or'], col_map['en']),
-    ]
-    
-    for src_lang, tgt_lang, src_col, tgt_col in directions:
-        sources = test_df[src_col].astype(str).tolist()
-        references = test_df[tgt_col].astype(str).tolist()
-        
-        results[f"{src_lang}_{tgt_lang}"] = evaluate_direction(
-            translator, sources, references, src_lang, tgt_lang
-        )
+
+    # Use trilingual test for all directions
+    sources_en = tri_test['English'].astype(str).tolist()
+    sources_am = tri_test['Amharic'].astype(str).tolist()
+    sources_or = tri_test['Oromo'].astype(str).tolist()
+
+    # EN → AM (use trilingual test)
+    results["en_am"] = evaluate_direction(translator, sources_en, sources_am, "en", "am")
+    results["en_am"]["source"] = "trilingual_test"
+
+    # AM → EN
+    results["am_en"] = evaluate_direction(translator, sources_am, sources_en, "am", "en")
+    results["am_en"]["source"] = "trilingual_test"
+
+    # AM → OR
+    results["am_or"] = evaluate_direction(translator, sources_am, sources_or, "am", "or")
+    results["am_or"]["source"] = "trilingual_test"
+
+    # OR → AM
+    results["or_am"] = evaluate_direction(translator, sources_or, sources_am, "or", "am")
+    results["or_am"]["source"] = "trilingual_test"
+
+    # EN → OR
+    results["en_or"] = evaluate_direction(translator, sources_en, sources_or, "en", "or")
+    results["en_or"]["source"] = "trilingual_test"
+
+    # OR → EN
+    results["or_en"] = evaluate_direction(translator, sources_or, sources_en, "or", "en")
+    results["or_en"]["source"] = "trilingual_test"
 
     # Summary
-    print("\n" + "=" * 60)
-    print("EVALUATION SUMMARY")
-    print("=" * 60)
-    
+    print("\n" + "=" * 70)
+    print("EVALUATION SUMMARY — HELD-OUT TEST SET")
+    print("=" * 70)
+
     for direction, metrics in results.items():
         print(f"\n  {direction}:")
         print(f"    BLEU:  {metrics['bleu']:.2f}")
         print(f"    chrF:  {metrics['chrf']:.2f}")
-        print(f"    Sents: {metrics['num_sentences']}")
+        print(f"    Sents: {metrics['num_sentences']} (held-out, unseen during training)")
 
-    # Save
+    # Save results
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=2)
-    
+
     print(f"\n✅ Results saved to {args.output}")
 
     # Average BLEU
     avg_bleu = sum(m['bleu'] for m in results.values()) / len(results)
     print(f"\n📊 Average BLEU across 6 directions: {avg_bleu:.2f}")
+    print("\n" + "=" * 70)
+    print("NOTE: These are HONEST scores on truly unseen test data.")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
