@@ -13,7 +13,7 @@
   "validation_data": {
     "trilingual_triples": 1999
   },
-  "model_config": {
+  "model_config": { 
     "d_model": 128,
     "n_heads": 4,
     "n_layers": 2,

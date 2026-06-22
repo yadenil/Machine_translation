@@ -4,6 +4,12 @@ Phase 5 - Milestone 3.1: Convergence (WITH LANGUAGE TAGS)
 FIXED: Added causal mask, padding masks, and proper label shifting
 """
 
+# ============ TENSORBOARD USAGE ============                          # TB: new
+# To launch TensorBoard, run:                                          # TB: new
+#   tensorboard --logdir=output/phase_5_milestone_3_1/tensorboard      # TB: new
+# Then open http://localhost:6006 in your browser.                     # TB: new
+# ============================================                         # TB: new
+
 import os
 import json
 import time
@@ -15,6 +21,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from collections import Counter
 import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter  # TB: new
+from collections import defaultdict  # TB: new — for per-pair BLEU tracking
 
 CONFIG = {
     'checkpoint_path': 'output/phase_5_milestone_2_2/trilingual_translator_v1_best.pt',
@@ -41,9 +49,17 @@ CONFIG = {
     'n_layers': 2,
     'max_seq_length': 50,
     'tokenizer_path': 'output/spm_unified_multilingual.model',
+    'val_bleu_interval': 2,      # TB: new — evaluate BLEU every N epochs
+    'val_bleu_samples': 200,     # TB: new — number of validation samples for BLEU
 }
 
 os.makedirs(CONFIG['output_dir'], exist_ok=True)
+
+# TB: new — Initialize TensorBoard writer
+tb_log_dir = os.path.join(CONFIG['output_dir'], 'tensorboard')  # TB: new
+writer = SummaryWriter(log_dir=tb_log_dir)                       # TB: new
+print(f"📊 TensorBoard log dir: {tb_log_dir}")                   # TB: new
+print(f"   Launch with: tensorboard --logdir={tb_log_dir}")       # TB: new
 
 import sentencepiece as spm
 
@@ -317,6 +333,161 @@ def generate_square_subsequent_mask(sz, device):
     mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)
     return mask.bool()  # True = masked position
 
+# TB: new — Greedy decode for BLEU evaluation
+@torch.no_grad()
+def greedy_decode(model, src_tensor, tgt_lang, max_len=CONFIG['max_seq_length']):
+    """Autoregressively generate target tokens given a source tensor."""
+    model.eval()
+    src = src_tensor.unsqueeze(0).to(device)  # (1, seq_len)
+    src_pad_mask = (src == PAD_ID)
+    
+    tgt_tag_id = TOKEN2ID[LANG_TAGS[tgt_lang]]
+    generated = [BOS_ID, tgt_tag_id]
+    
+    for _ in range(max_len - 2):
+        tgt_tensor = torch.tensor([generated], dtype=torch.long, device=device)
+        tgt_len = tgt_tensor.size(1)
+        tgt_mask = generate_square_subsequent_mask(tgt_len, device)
+        tgt_pad_mask = (tgt_tensor == PAD_ID)
+        
+        logits = model(src, tgt_tensor,
+                       tgt_mask=tgt_mask,
+                       src_key_padding_mask=src_pad_mask,
+                       tgt_key_padding_mask=tgt_pad_mask)
+        next_token = logits[0, -1, :].argmax().item()
+        
+        if next_token == EOS_ID:
+            break
+        generated.append(next_token)
+    
+    return generated[2:]  # Strip BOS and language tag
+
+# TB: new — BLEU-4 computation (corpus-level)
+def compute_bleu(references, hypotheses, max_n=4):
+    """Compute corpus-level BLEU score with brevity penalty."""
+    from collections import Counter
+    import math
+    
+    clipped_counts = [0] * max_n
+    total_counts = [0] * max_n
+    ref_len = 0
+    hyp_len = 0
+    
+    for ref, hyp in zip(references, hypotheses):
+        ref_len += len(ref)
+        hyp_len += len(hyp)
+        
+        for n in range(1, max_n + 1):
+            ref_ngrams = Counter()
+            for i in range(len(ref) - n + 1):
+                ref_ngrams[tuple(ref[i:i+n])] += 1
+            
+            hyp_ngrams = Counter()
+            for i in range(len(hyp) - n + 1):
+                hyp_ngrams[tuple(hyp[i:i+n])] += 1
+            
+            for ng, count in hyp_ngrams.items():
+                clipped_counts[n-1] += min(count, ref_ngrams.get(ng, 0))
+                total_counts[n-1] += count
+    
+    # Avoid log(0)
+    precisions = []
+    for n in range(max_n):
+        if total_counts[n] == 0:
+            return 0.0
+        precisions.append(clipped_counts[n] / total_counts[n])
+    
+    # Geometric mean of precisions
+    log_avg = sum(math.log(p) if p > 0 else float('-inf') for p in precisions) / max_n
+    if log_avg == float('-inf'):
+        return 0.0
+    
+    # Brevity penalty
+    if hyp_len == 0:
+        return 0.0
+    bp = math.exp(min(0, 1 - ref_len / hyp_len))
+    
+    return bp * math.exp(log_avg)
+
+# TB: new — Evaluate BLEU on validation splits
+@torch.no_grad()
+def evaluate_bleu(model, tri_val, en_am_val, am_or_val, n_samples=CONFIG['val_bleu_samples']):
+    """Compute BLEU on a sample of validation data for each language pair."""
+    model.eval()
+    pair_results = defaultdict(lambda: {'refs': [], 'hyps': []})
+    
+    # --- Trilingual validation pairs ---
+    tri_sample = tri_val.sample(n=min(n_samples // 4, len(tri_val)), random_state=None)
+    for _, row in tri_sample.iterrows():
+        for src_lang, tgt_lang, src_col, tgt_col in [
+            ('en', 'am', 'English', 'Amharic'),
+            ('am', 'en', 'Amharic', 'English'),
+        ]:
+            src_ids = encode_sentence(row[src_col], src_lang)
+            src_tensor = torch.tensor(src_ids, dtype=torch.long)
+            hyp_ids = greedy_decode(model, src_tensor, tgt_lang)
+            ref_ids = encode_sentence(row[tgt_col], tgt_lang)
+            # Strip special tokens from reference
+            ref_clean = [t for t in ref_ids if t not in (PAD_ID, BOS_ID, EOS_ID)]
+            # Also strip any language tag ids from ref
+            lang_tag_ids = set(TOKEN2ID[v] for v in LANG_TAGS.values())
+            ref_clean = [t for t in ref_clean if t not in lang_tag_ids]
+            pair_key = f"{src_lang.upper()}→{tgt_lang.upper()}"
+            pair_results[pair_key]['refs'].append(ref_clean)
+            pair_results[pair_key]['hyps'].append(hyp_ids)
+    
+    # --- EN-AM validation pairs ---
+    enam_sample = en_am_val.sample(n=min(n_samples // 4, len(en_am_val)), random_state=None)
+    for _, row in enam_sample.iterrows():
+        for src_lang, tgt_lang, src_col, tgt_col in [
+            ('en', 'am', 'English', 'Amharic'),
+            ('am', 'en', 'Amharic', 'English'),
+        ]:
+            src_ids = encode_sentence(row[src_col], src_lang)
+            src_tensor = torch.tensor(src_ids, dtype=torch.long)
+            hyp_ids = greedy_decode(model, src_tensor, tgt_lang)
+            ref_ids = encode_sentence(row[tgt_col], tgt_lang)
+            ref_clean = [t for t in ref_ids if t not in (PAD_ID, BOS_ID, EOS_ID)]
+            lang_tag_ids = set(TOKEN2ID[v] for v in LANG_TAGS.values())
+            ref_clean = [t for t in ref_clean if t not in lang_tag_ids]
+            pair_key = f"{src_lang.upper()}→{tgt_lang.upper()}"
+            pair_results[pair_key]['refs'].append(ref_clean)
+            pair_results[pair_key]['hyps'].append(hyp_ids)
+    
+    # --- AM-OR validation pairs ---
+    amor_sample = am_or_val.sample(n=min(n_samples // 4, len(am_or_val)), random_state=None)
+    amor_cols = list(amor_sample.columns)
+    for _, row in amor_sample.iterrows():
+        c = list(row)
+        for src_lang, tgt_lang, src_text, tgt_text in [
+            ('am', 'or', c[0], c[1]),
+            ('or', 'am', c[1], c[0]),
+        ]:
+            src_ids = encode_sentence(src_text, src_lang)
+            src_tensor = torch.tensor(src_ids, dtype=torch.long)
+            hyp_ids = greedy_decode(model, src_tensor, tgt_lang)
+            ref_ids = encode_sentence(tgt_text, tgt_lang)
+            ref_clean = [t for t in ref_ids if t not in (PAD_ID, BOS_ID, EOS_ID)]
+            lang_tag_ids = set(TOKEN2ID[v] for v in LANG_TAGS.values())
+            ref_clean = [t for t in ref_clean if t not in lang_tag_ids]
+            pair_key = f"{src_lang.upper()}→{tgt_lang.upper()}"
+            pair_results[pair_key]['refs'].append(ref_clean)
+            pair_results[pair_key]['hyps'].append(hyp_ids)
+    
+    # Compute BLEU per pair
+    bleu_scores = {}
+    for pair_key, data in sorted(pair_results.items()):
+        bleu_scores[pair_key] = compute_bleu(data['refs'], data['hyps'])
+    
+    # Overall average
+    if bleu_scores:
+        bleu_scores['AVG'] = sum(bleu_scores.values()) / len(bleu_scores)
+    else:
+        bleu_scores['AVG'] = 0.0
+    
+    model.train()
+    return bleu_scores
+
 for epoch_idx in range(CONFIG['epochs']):
     abs_epoch = CONFIG['start_epoch'] + epoch_idx
     
@@ -372,18 +543,41 @@ for epoch_idx in range(CONFIG['epochs']):
         epoch_loss += loss.item()
         batch_count += 1
         
+        # TB: new — Log batch loss
+        global_step = epoch_idx * len(dataloader) + batch_idx  # TB: new
+        writer.add_scalar('Train/Loss_batch', loss.item(), global_step)  # TB: new
+        
         if (batch_idx + 1) % 500 == 0:
             print(f"    Batch {batch_idx+1}/{len(dataloader)} | Loss: {loss.item():.4f}")
+            writer.add_scalar('Train/LR', current_lr, global_step)  # TB: new — LR every 500 batches
     
     avg_loss = epoch_loss / batch_count
     losses.append(avg_loss)
     lr_history.append(current_lr)
     
-    # Placeholder for BLEU (replace with real eval when ready)
+    # TB: new — Log epoch-level metrics
+    epoch_global_step = (epoch_idx + 1) * len(dataloader)              # TB: new
+    writer.add_scalar('Train/Loss_epoch', avg_loss, epoch_global_step)  # TB: new
+    writer.add_scalar('Train/LR', current_lr, epoch_global_step)        # TB: new — LR at epoch end
+    
+    # TB: new — Real BLEU evaluation on validation data
     val_bleu = 0.0
+    bleu_str = ''
+    if (epoch_idx + 1) % CONFIG['val_bleu_interval'] == 0 or epoch_idx == CONFIG['epochs'] - 1:  # TB: new
+        print(f"    Evaluating BLEU on validation set...")                                       # TB: new
+        bleu_scores = evaluate_bleu(model, tri_val, en_am_val, am_or_val)                        # TB: new
+        val_bleu = bleu_scores.get('AVG', 0.0)                                                   # TB: new
+        # Log per-pair BLEU to TensorBoard                                                       # TB: new
+        for pair_key, score in bleu_scores.items():                                              # TB: new
+            tag = f"Val/BLEU_{pair_key.replace('→', '_to_')}"                                    # TB: new
+            writer.add_scalar(tag, score, epoch_global_step)                                     # TB: new
+        # Print per-pair breakdown                                                               # TB: new
+        pair_strs = [f"{k}={v:.4f}" for k, v in bleu_scores.items()]                             # TB: new
+        print(f"    BLEU: {' | '.join(pair_strs)}")                                              # TB: new
+        bleu_str = f" | BLEU={val_bleu:.4f}"                                                     # TB: new
     val_bleus.append(val_bleu)
     
-    # Save best by loss (since BLEU is placeholder)
+    # Save best by loss
     if avg_loss < best_loss:
         best_loss = avg_loss
         best_epoch = abs_epoch
@@ -400,6 +594,7 @@ for epoch_idx in range(CONFIG['epochs']):
             'vocab_size': VOCAB_SIZE,
         }, f"{CONFIG['output_dir']}/final_translator_best.pt")
         print(f"    ✓ NEW BEST saved (loss: {avg_loss:.4f})")
+        writer.add_scalar('Train/Best_loss', avg_loss, epoch_global_step)  # TB: new — Best loss marker
     else:
         patience_counter += 1
     
@@ -409,11 +604,11 @@ for epoch_idx in range(CONFIG['epochs']):
     def fmt(t):
         return f"{int(t//3600)}h {int((t%3600)//60)}m"
     
-    print(f"  Epoch {abs_epoch:2d}: Loss={avg_loss:.4f} | LR={current_lr:.0e} | "
-          f"Time={fmt(epoch_time)} | Elapsed={fmt(elapsed)}{' [FROZEN]' if False else ''}")
+    print(f"  Epoch {abs_epoch:2d}: Loss={avg_loss:.4f} | LR={current_lr:.0e}{bleu_str}"
+          f" | Time={fmt(epoch_time)} | Elapsed={fmt(elapsed)}{' [FROZEN]' if False else ''}")
     
     if patience_counter >= CONFIG['patience']:
-        print(f"\n  🛑 Early stopping!")
+        print(f"\n  Early stopping!")
         break
 
 # Final save
@@ -431,6 +626,9 @@ torch.save({
         'lr_history': lr_history,
     }
 }, f"{CONFIG['output_dir']}/final_translator_multilingual.pt")
+
+writer.close()  # TB: new — Flush and close TensorBoard writer
+print(f"📊 TensorBoard logs saved to: {tb_log_dir}")  # TB: new
 
 print("\n" + "="*80)
 print("MILESTONE 3.1 COMPLETE")

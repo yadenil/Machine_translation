@@ -1,0 +1,38 @@
+{
+  "en_am": {
+    "bleu": 0.71403911956453,
+    "chrf": 9.915521727335555,
+    "num_sentences": 200,
+    "source": "trilingual_test"
+  },
+  "am_en": {
+    "bleu": 2.7909183944033833,
+    "chrf": 15.573724279163335,
+    "num_sentences": 200,
+    "source": "trilingual_test"
+  },
+  "am_or": {
+    "bleu": 4.291593682024144,
+    "chrf": 21.372126789192684,
+    "num_sentences": 200,
+    "source": "trilingual_test"
+  },
+  "or_am": {
+    "bleu": 1.0326544492738037,
+    "chrf": 13.488957145553801,
+    "num_sentences": 200,
+    "source": "trilingual_test"
+  },
+  "en_or": {
+    "bleu": 1.0565998855017917,
+    "chrf": 17.694271812917407,
+    "num_sentences": 200,
+    "source": "trilingual_test"
+  },
+  "or_en": {
+    "bleu": 2.8120084022291603,
+    "chrf": 15.127027880248775,
+    "num_sentences": 200,
+    "source": "trilingual_test"
+  }
+}
