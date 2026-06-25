@@ -426,49 +426,43 @@ def log_attention_heatmap(model, src_ids, tgt_ids, writer, global_step, device):
             return_attention=True
         )
     
-    if not (all_self_attn and all_cross_attn):
-        model.train()
-        return
-    
-    last_self = all_self_attn[-1][0].cpu().numpy()   # (n_heads, tgt_len, tgt_len)
-    last_cross = all_cross_attn[-1][0].cpu().numpy()  # (n_heads, tgt_len, src_len)
-    
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    
-    # Self-attention
-    for h in range(min(3, last_self.shape[0])):
-        ax = axes[0, h]
-        im = ax.imshow(last_self[h], cmap='viridis', aspect='auto')
-        ax.set_title(f'Self-Attn Head {h}')
-        plt.colorbar(im, ax=ax)
-    
-    # Cross-attention
-    for h in range(min(3, last_cross.shape[0])):
-        ax = axes[1, h]
-        im = ax.imshow(last_cross[h], cmap='viridis', aspect='auto')
-        ax.set_title(f'Cross-Attn Head {h}')
-        plt.colorbar(im, ax=ax)
-    
-    plt.tight_layout()
-    
-    # Convert figure to image for TensorBoard
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    img = Image.open(buf)
-    img_array = np.array(img)
-    
-    # add_image expects (C, H, W) — convert RGB
-    img_tensor = torch.from_numpy(img_array).permute(2, 0, 1)  # (H, W, C) → (C, H, W)
-    img_tensor = img_tensor.float() / 255.0  # Normalize to [0, 1]
-    
-    writer.add_image('Attention/All_Heads', img_tensor, global_step)
-    
-    plt.close(fig)
-    buf.close()
+    if all_self_attn and all_cross_attn:
+        # all_self_attn[-1] shape: (batch, n_heads, tgt_len, tgt_len)
+        # We take first batch: [0] → (n_heads, tgt_len, tgt_len)
+        last_self = all_self_attn[-1][0].cpu().numpy()   # (n_heads, tgt_len, tgt_len)
+        last_cross = all_cross_attn[-1][0].cpu().numpy()  # (n_heads, tgt_len, src_len)
+        
+        # Self-attention heads
+        for h in range(min(3, last_self.shape[0])):
+            heatmap = last_self[h]  # (tgt_len, tgt_len)
+            
+            # Ensure float32 and proper range
+            heatmap = np.float32(heatmap)
+            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+            
+            # Convert to (1, H, W) — single channel grayscale
+            # add_image expects (C, H, W) where C=1 for grayscale, C=3 for RGB
+            img = torch.from_numpy(heatmap).unsqueeze(0)  # (1, H, W)
+            
+            # Ensure values are in [0, 1]
+            img = torch.clamp(img, 0, 1)
+            
+            writer.add_image(f'Attention/self_attn_head{h}', img, global_step)
+        
+        # Cross-attention heads
+        for h in range(min(3, last_cross.shape[0])):
+            heatmap = last_cross[h]  # (tgt_len, src_len)
+            
+            heatmap = np.float32(heatmap)
+            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+            
+            img = torch.from_numpy(heatmap).unsqueeze(0)  # (1, H, W)
+            img = torch.clamp(img, 0, 1)
+            
+            writer.add_image(f'Attention/cross_attn_head{h}', img, global_step)
     
     model.train()
- 
+    
 def log_translation_examples(model, samples, writer, global_step, device):
     model.eval()
     texts = []
