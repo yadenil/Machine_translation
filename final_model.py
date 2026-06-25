@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
 Phase 5 - Milestone 3.1: Convergence (WITH LANGUAGE TAGS)
-FIXED: Added causal mask, padding masks, proper label shifting,
-       train/val/test split, and comprehensive TensorBoard logging.
+FRESH START: Custom decoder with attention weights, causal mask, train/val/test split
 """
 
 import os
 import json
 import time
 import math
-import io
 import pandas as pd
 import numpy as np
 import torch
@@ -18,7 +16,6 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from collections import defaultdict, Counter
-from PIL import Image
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -27,17 +24,16 @@ import sentencepiece as spm
 
 # ============ CONFIG ============
 CONFIG = {
-    'checkpoint_path': 'output/phase_5_milestone_2_2/trilingual_translator_v1_best.pt',
     'trilingual_path': 'output/data_final/clean_translation_final.csv',
     'en_am_path': 'output/data_final/amharic_english_final.csv',
     'am_or_path': 'output/data_final/amharic_oromo_final.csv',
-    'output_dir': 'output/phase_5_milestone_3_1',
-    'start_epoch': 41,
-    'epochs': 20,
+    'output_dir': 'output/phase_5_milestone_3_1_fresh',
+    'start_epoch': 0,
+    'epochs': 50,
     'batch_size': 64,
     'base_lr': 3e-4,
     'lr_decay_factor': 0.1,
-    'lr_decay_every': 5,
+    'lr_decay_every': 10,
     'epoch_size': 80000,
     'tri_pct': 0.50,
     'en_am_pct': 0.25,
@@ -45,7 +41,7 @@ CONFIG = {
     'tri_duplication': 5,
     'tri_weight': 2.0,
     'bi_weight': 0.8,
-    'patience': 10,
+    'patience': 15,
     'd_model': 128,
     'n_heads': 4,
     'n_layers': 2,
@@ -66,7 +62,7 @@ print(f"   Launch with: tensorboard --logdir={tb_log_dir}")
 print(f"   Then open: http://localhost:6006")
 
 print("="*80)
-print("PHASE 5 - MILESTONE 3.1: CONVERGENCE (WITH LANGUAGE TAGS) [FIXED]")
+print("PHASE 5 - MILESTONE 3.1: FRESH START WITH CUSTOM DECODER")
 print("="*80)
 
 # ============ TOKENIZER & VOCAB ============
@@ -247,22 +243,19 @@ dataloader = DataLoader(dataset, batch_size=CONFIG['batch_size'], shuffle=True,
 print(f"✓ Dataset: {len(dataset)} samples/epoch")
 
 
-# ============ MODEL ============
+# ============ CUSTOM MODEL WITH ATTENTION WEIGHTS ============
 class CustomTransformerDecoderLayer(nn.Module):
     """Custom decoder layer that returns attention weights."""
     def __init__(self, d_model, n_heads, dim_feedforward=512, dropout=0.1):
         super().__init__()
         self.d_model = d_model
-        
-        # Self-attention (decoder looks at itself)
+
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=dropout)
         self.norm1 = nn.LayerNorm(d_model)
-        
-        # Cross-attention (decoder looks at encoder)
+
         self.cross_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=dropout)
         self.norm2 = nn.LayerNorm(d_model)
-        
-        # Feedforward
+
         self.ff = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.ReLU(),
@@ -271,35 +264,31 @@ class CustomTransformerDecoderLayer(nn.Module):
             nn.Dropout(dropout)
         )
         self.norm3 = nn.LayerNorm(d_model)
-        
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, tgt, memory, tgt_mask=None, tgt_key_padding_mask=None,
                 memory_key_padding_mask=None):
-        # Self-attention with residual
         tgt2, self_attn_weights = self.self_attn(
             tgt, tgt, tgt,
             attn_mask=tgt_mask,
             key_padding_mask=tgt_key_padding_mask,
-            need_weights=True  # ← Return attention weights
+            need_weights=True
         )
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm1(tgt)
-        
-        # Cross-attention with residual
+
         tgt2, cross_attn_weights = self.cross_attn(
             tgt, memory, memory,
             key_padding_mask=memory_key_padding_mask,
-            need_weights=True  # ← Return attention weights
+            need_weights=True
         )
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm2(tgt)
-        
-        # Feedforward with residual
+
         tgt2 = self.ff(tgt)
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm3(tgt)
-        
+
         return tgt, self_attn_weights, cross_attn_weights
 
 
@@ -307,37 +296,33 @@ class SimpleTransformer(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_heads=4, n_layers=2):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
-        
-        # Encoder (standard)
+
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads,
             dim_feedforward=512, batch_first=True, dropout=0.1
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-        
-        # Custom decoder layers
+
         self.decoder_layers = nn.ModuleList([
             CustomTransformerDecoderLayer(d_model, n_heads)
             for _ in range(n_layers)
         ])
-        
+
         self.output_projection = nn.Linear(d_model, vocab_size)
-        
+
     def forward(self, src, tgt, tgt_mask=None,
                 src_key_padding_mask=None,
                 tgt_key_padding_mask=None,
                 return_attention=False):
         src_emb = self.embedding(src)
         tgt_emb = self.embedding(tgt)
-        
-        # Encode
+
         enc_out = self.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
-        
-        # Decode with custom layers
+
         dec_out = tgt_emb
         all_self_attn = []
         all_cross_attn = []
-        
+
         for layer in self.decoder_layers:
             dec_out, self_attn, cross_attn = layer(
                 dec_out, enc_out,
@@ -348,39 +333,29 @@ class SimpleTransformer(nn.Module):
             if return_attention:
                 all_self_attn.append(self_attn)
                 all_cross_attn.append(cross_attn)
-        
+
         output = self.output_projection(dec_out)
-        
+
         if return_attention:
             return output, all_self_attn, all_cross_attn
         return output
-    
-# ============ LOAD CHECKPOINT ============
-print("\n[4/8] Loading checkpoint from Phase 5.2...")
+
+
+# ============ FRESH START - NO CHECKPOINT ============
+print("\n[4/8] Initializing fresh model (no checkpoint loaded)...")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = SimpleTransformer(VOCAB_SIZE, CONFIG['d_model'], CONFIG['n_heads'], CONFIG['n_layers'])
 
-start_epoch_abs = CONFIG['start_epoch']
+start_epoch_abs = 0
 best_val_bleu = 0.0
 patience_counter = 0
 
-if os.path.exists(CONFIG['checkpoint_path']):
-    ckpt = torch.load(CONFIG['checkpoint_path'], map_location=device)
-    if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
-        print("✓ Loaded from Phase 5.2")
-        if 'epoch' in ckpt:
-            start_epoch_abs = ckpt['epoch'] + 1
-    else:
-        print("⚠ Could not load checkpoint")
-else:
-    print("⚠ No checkpoint found")
+print("✓ Fresh model initialized — training from scratch with custom decoder")
 
 model = model.to(device)
 
-
 # ============ TRAINING ============
-print("\n[5/8] Starting convergence training...")
+print("\n[5/8] Starting fresh training...")
 
 criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
 losses = []
@@ -434,16 +409,14 @@ def log_weight_histograms(model, writer, global_step):
 
 
 def log_attention_heatmap(model, src_ids, tgt_ids, writer, global_step, device):
-    """Log attention heatmaps from the last decoder layer."""
     model.eval()
-    
+
     src_tensor = torch.tensor([src_ids], dtype=torch.long, device=device)
     tgt_tensor = torch.tensor([tgt_ids], dtype=torch.long, device=device)
-    
+
     with torch.no_grad():
         tgt_mask = generate_square_subsequent_mask(tgt_tensor.size(1), device)
-        
-        # Forward with attention return
+
         _, all_self_attn, all_cross_attn = model(
             src_tensor, tgt_tensor,
             tgt_mask=tgt_mask,
@@ -451,27 +424,25 @@ def log_attention_heatmap(model, src_ids, tgt_ids, writer, global_step, device):
             tgt_key_padding_mask=(tgt_tensor == PAD_ID),
             return_attention=True
         )
-    
-    # Log last layer's attention (index -1)
+
     if all_self_attn and all_cross_attn:
-        last_self = all_self_attn[-1][0].cpu().numpy()   # (n_heads, tgt_len, tgt_len)
-        last_cross = all_cross_attn[-1][0].cpu().numpy()  # (n_heads, tgt_len, src_len)
-        
-        # Self-attention heads
+        last_self = all_self_attn[-1][0].cpu().numpy()
+        last_cross = all_cross_attn[-1][0].cpu().numpy()
+
         for h in range(min(3, last_self.shape[0])):
             heatmap = last_self[h]
             heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
             img = torch.tensor(heatmap).unsqueeze(0)
             writer.add_image(f'Attention/self_attn_head{h}', img, global_step)
-        
-        # Cross-attention heads
+
         for h in range(min(3, last_cross.shape[0])):
             heatmap = last_cross[h]
             heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
             img = torch.tensor(heatmap).unsqueeze(0)
             writer.add_image(f'Attention/cross_attn_head{h}', img, global_step)
-    
+
     model.train()
+
 
 def log_translation_examples(model, samples, writer, global_step, device):
     model.eval()
@@ -793,7 +764,7 @@ writer.close()
 print(f"📊 TensorBoard logs saved to: {tb_log_dir}")
 
 print("\n" + "="*80)
-print("MILESTONE 3.1 COMPLETE")
+print("MILESTONE 3.1 COMPLETE — FRESH TRAINING")
 print("="*80)
 print(f"✓ Final model: {CONFIG['output_dir']}/final_translator_multilingual.pt")
 print(f"✓ Best model:  {CONFIG['output_dir']}/final_translator_best.pt")
