@@ -248,43 +248,113 @@ print(f"✓ Dataset: {len(dataset)} samples/epoch")
 
 
 # ============ MODEL ============
+class CustomTransformerDecoderLayer(nn.Module):
+    """Custom decoder layer that returns attention weights."""
+    def __init__(self, d_model, n_heads, dim_feedforward=512, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        
+        # Self-attention (decoder looks at itself)
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        
+        # Cross-attention (decoder looks at encoder)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # Feedforward
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout)
+        )
+        self.norm3 = nn.LayerNorm(d_model)
+        
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, tgt, memory, tgt_mask=None, tgt_key_padding_mask=None,
+                memory_key_padding_mask=None):
+        # Self-attention with residual
+        tgt2, self_attn_weights = self.self_attn(
+            tgt, tgt, tgt,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=True  # ← Return attention weights
+        )
+        tgt = tgt + self.dropout(tgt2)
+        tgt = self.norm1(tgt)
+        
+        # Cross-attention with residual
+        tgt2, cross_attn_weights = self.cross_attn(
+            tgt, memory, memory,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=True  # ← Return attention weights
+        )
+        tgt = tgt + self.dropout(tgt2)
+        tgt = self.norm2(tgt)
+        
+        # Feedforward with residual
+        tgt2 = self.ff(tgt)
+        tgt = tgt + self.dropout(tgt2)
+        tgt = self.norm3(tgt)
+        
+        return tgt, self_attn_weights, cross_attn_weights
+
+
 class SimpleTransformer(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_heads=4, n_layers=2):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
+        
+        # Encoder (standard)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads,
-            dim_feedforward=512, batch_first=True
+            dim_feedforward=512, batch_first=True, dropout=0.1
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-        dec_layer = nn.TransformerDecoderLayer(
-            d_model=d_model, nhead=n_heads,
-            dim_feedforward=512, batch_first=True
-        )
-        self.decoder = nn.TransformerDecoder(dec_layer, num_layers=n_layers)
+        
+        # Custom decoder layers
+        self.decoder_layers = nn.ModuleList([
+            CustomTransformerDecoderLayer(d_model, n_heads)
+            for _ in range(n_layers)
+        ])
+        
         self.output_projection = nn.Linear(d_model, vocab_size)
-
+        
     def forward(self, src, tgt, tgt_mask=None,
                 src_key_padding_mask=None,
-                tgt_key_padding_mask=None):
+                tgt_key_padding_mask=None,
+                return_attention=False):
         src_emb = self.embedding(src)
         tgt_emb = self.embedding(tgt)
+        
+        # Encode
         enc_out = self.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
-        dec_out = self.decoder(
-            tgt_emb, enc_out,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=src_key_padding_mask
-        )
-        return self.output_projection(dec_out)
-
-    def get_encoder_params(self):
-        return list(self.encoder.parameters())
-
-    def get_decoder_params(self):
-        return [p for n, p in self.named_parameters() if 'encoder.' not in n]
-
-
+        
+        # Decode with custom layers
+        dec_out = tgt_emb
+        all_self_attn = []
+        all_cross_attn = []
+        
+        for layer in self.decoder_layers:
+            dec_out, self_attn, cross_attn = layer(
+                dec_out, enc_out,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=src_key_padding_mask
+            )
+            if return_attention:
+                all_self_attn.append(self_attn)
+                all_cross_attn.append(cross_attn)
+        
+        output = self.output_projection(dec_out)
+        
+        if return_attention:
+            return output, all_self_attn, all_cross_attn
+        return output
+    
 # ============ LOAD CHECKPOINT ============
 print("\n[4/8] Loading checkpoint from Phase 5.2...")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -364,41 +434,44 @@ def log_weight_histograms(model, writer, global_step):
 
 
 def log_attention_heatmap(model, src_ids, tgt_ids, writer, global_step, device):
+    """Log attention heatmaps from the last decoder layer."""
     model.eval()
+    
     src_tensor = torch.tensor([src_ids], dtype=torch.long, device=device)
     tgt_tensor = torch.tensor([tgt_ids], dtype=torch.long, device=device)
-
-    attn_maps = {}
-    def make_hook(name):
-        def hook(module, input, output):
-            if isinstance(output, tuple) and len(output) > 1:
-                attn_maps[name] = output[1].detach().cpu().numpy()
-        return hook
-
-    last_layer = model.decoder.layers[-1]
-    h1 = last_layer.self_attn.register_forward_hook(make_hook('self_attn'))
-    h2 = last_layer.multihead_attn.register_forward_hook(make_hook('cross_attn'))
-
+    
     with torch.no_grad():
         tgt_mask = generate_square_subsequent_mask(tgt_tensor.size(1), device)
-        _ = model(src_tensor, tgt_tensor, tgt_mask=tgt_mask,
-                  src_key_padding_mask=(src_tensor == PAD_ID),
-                  tgt_key_padding_mask=(tgt_tensor == PAD_ID))
-
-    h1.remove()
-    h2.remove()
-
-    for attn_name, weights in attn_maps.items():
-        if weights is not None:
-            w = weights[0]
-            for h in range(min(3, w.shape[0])):
-                heatmap = w[h]
-                heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-                img = torch.tensor(heatmap).unsqueeze(0)
-                writer.add_image(f'Attention/{attn_name}_head{h}', img, global_step)
-
+        
+        # Forward with attention return
+        _, all_self_attn, all_cross_attn = model(
+            src_tensor, tgt_tensor,
+            tgt_mask=tgt_mask,
+            src_key_padding_mask=(src_tensor == PAD_ID),
+            tgt_key_padding_mask=(tgt_tensor == PAD_ID),
+            return_attention=True
+        )
+    
+    # Log last layer's attention (index -1)
+    if all_self_attn and all_cross_attn:
+        last_self = all_self_attn[-1][0].cpu().numpy()   # (n_heads, tgt_len, tgt_len)
+        last_cross = all_cross_attn[-1][0].cpu().numpy()  # (n_heads, tgt_len, src_len)
+        
+        # Self-attention heads
+        for h in range(min(3, last_self.shape[0])):
+            heatmap = last_self[h]
+            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+            img = torch.tensor(heatmap).unsqueeze(0)
+            writer.add_image(f'Attention/self_attn_head{h}', img, global_step)
+        
+        # Cross-attention heads
+        for h in range(min(3, last_cross.shape[0])):
+            heatmap = last_cross[h]
+            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+            img = torch.tensor(heatmap).unsqueeze(0)
+            writer.add_image(f'Attention/cross_attn_head{h}', img, global_step)
+    
     model.train()
-
 
 def log_translation_examples(model, samples, writer, global_step, device):
     model.eval()
