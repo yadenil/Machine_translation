@@ -7,7 +7,6 @@ import re
 EXCEL_PATH  = "text.xlsx"
 OUTPUT_DIR  = "output"
 OUTPUT_CSV  = os.path.join(OUTPUT_DIR, "clean_translation.csv")
-OUTPUT_XLSX = os.path.join(OUTPUT_DIR, "normalized_translations.xlsx")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -124,7 +123,5 @@ print("=" * 70)
 # ── Step 4 — Save ─────────────────────────────────────────────────────────────
 # TSV — tab separator means commas inside fields never need CSV quoting
 df.to_csv(OUTPUT_CSV, sep="\t", index=False)
-df.to_excel(OUTPUT_XLSX, index=False)
 
 print(f"\nSaved → {OUTPUT_CSV}   (tab-separated, no field quoting)")
-print(f"Saved → {OUTPUT_XLSX}")
